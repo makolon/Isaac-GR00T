@@ -102,7 +102,7 @@ def _modality_config_text(action_space: str, embodiment_tag: str) -> str:
     if action_space == "joint":
         modality_keys = ["single_arm", "gripper"]
         action_configs = (
-            "        ActionConfig(rep=ActionRepresentation.RELATIVE, type=ActionType.NON_EEF, format=ActionFormat.DEFAULT),\n"
+            "        ActionConfig(rep=ActionRepresentation.ABSOLUTE, type=ActionType.NON_EEF, format=ActionFormat.DEFAULT),\n"
             "        ActionConfig(rep=ActionRepresentation.ABSOLUTE, type=ActionType.NON_EEF, format=ActionFormat.DEFAULT),\n"
         )
     else:
