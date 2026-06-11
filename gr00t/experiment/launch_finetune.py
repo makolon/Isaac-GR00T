@@ -89,7 +89,9 @@ if __name__ == "__main__":
 
     config.model.load_bf16 = False
     config.model.reproject_vision = False
-    config.model.model_name = "nvidia/Cosmos-Reason2-2B"
+    # A local path here avoids HF hub lookups at model init (offline clusters);
+    # transformers 4.57.3 _patch_mistral_regex also hits the network for repo ids.
+    config.model.model_name = os.environ.get("GR00T_BACKBONE_PATH", "nvidia/Cosmos-Reason2-2B")
     config.model.backbone_trainable_params_fp32 = True
     config.model.use_relative_action = True
 
@@ -113,6 +115,9 @@ if __name__ == "__main__":
     config.data.shard_size = ft_config.shard_size
     config.data.episode_sampling_rate = ft_config.episode_sampling_rate
     config.data.num_shards_per_epoch = ft_config.num_shards_per_epoch
+    # torchcodec needs system FFmpeg shared libs; decord vendors its own
+    # (offline clusters without FFmpeg set GR00T_VIDEO_BACKEND=decord).
+    config.data.video_backend = os.environ.get("GR00T_VIDEO_BACKEND", config.data.video_backend)
 
     config.training.save_only_model = ft_config.save_only_model
     config.training.skip_weight_loading = ft_config.skip_weight_loading

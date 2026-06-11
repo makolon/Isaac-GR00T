@@ -407,7 +407,9 @@ def get_frames_by_indices(
         return decoder.get_frames_at(indices=indices).data.numpy()
     elif video_backend == "decord":
         decord = _lazy_import_decord()
-        vr = decord.VideoReader(video_path, **video_backend_kwargs)
+        # auto threads (0) x many DataLoader workers exhausts the job's pid
+        # limit on HPC nodes ("can't start new thread")
+        vr = decord.VideoReader(video_path, **{"num_threads": 1, **video_backend_kwargs})
         frames = vr.get_batch(indices)
         return frames.asnumpy()
     elif video_backend == "ffmpeg":
