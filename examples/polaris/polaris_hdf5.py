@@ -5,10 +5,12 @@ polaris_real2sim root package (and its IsaacLab / gsplat dependencies). Only
 ``h5py`` / ``numpy`` / ``imageio`` are required. Mirrors the per-episode layout
 written by ``polaris_tamp.utils.hdf5_utils.Hdf5EpisodeRecorder``.
 
-Two action spaces (selected by the converter's ``--action-space`` flag):
-- ``joint``: arm joint positions + gripper; action = recorded joint target.
-- ``ee``: end-effector pose (xyz + 6D rotation) + gripper; action = delta-EE
-  pose (xyz delta + relative-rotation 6D) + absolute gripper target.
+State/action follow GR00T's pretrained DROID embodiment
+(``oxe_droid_relative_eef_relative_joint``): ``[eef_9d (9), gripper_position
+(1), joint_position (7)]``. Actions are stored absolute; GR00T's processor
+relativizes the EEF/joint keys against the current state at train time and
+un-relativizes at inference, so a checkpoint fine-tuned on this layout
+evaluates through the unchanged zero-shot client.
 """
 
 from __future__ import annotations
@@ -23,11 +25,12 @@ import imageio.v2 as imageio
 import numpy as np
 
 
-# DROID view numbering does not match by name: sim ``external_cam_2`` is DROID
-# view 1, sim ``external_cam`` is DROID view 2, hence exterior_1 -> external_cam_2.
+# exterior_1 must be the camera the zero-shot eval client sends as
+# ``exterior_image_1_left`` (sim ``external_cam``), so SFT checkpoints stay
+# plug-compatible with the unchanged ``Gr00tN17FrankaDroidClient``.
 DEFAULT_SPLAT_ROLES: dict[str, str] = {
-    "exterior_1": "splat.external_cam_2",
-    "exterior_2": "splat.external_cam",
+    "exterior_1": "splat.external_cam",
+    "exterior_2": "splat.external_cam_2",
     "wrist": "splat.wrist_cam",
 }
 
@@ -164,7 +167,11 @@ class Hdf5DatasetReader:
             yield Hdf5EpisodeReader(path)
 
 
-_IDENTITY_ROT6D = np.array([1.0, 0.0, 0.0, 0.0, 1.0, 0.0], dtype=np.float32)
+# Egocentric EE-frame correction applied by GR00T's DROID reference inference
+# (and the zero-shot eval client) before encoding eef_9d.
+_DROID_EEF_ROTATION_CORRECT = np.array(
+    [[0.0, 0.0, -1.0], [-1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float64
+)
 
 
 def normalize_gripper(
@@ -195,11 +202,12 @@ def quat_wxyz_to_matrix(quat: np.ndarray) -> np.ndarray:
     return mat
 
 
-def matrix_to_rot6d(mat: np.ndarray) -> np.ndarray:
-    """First two columns of ``(..., 3, 3)`` matrices flattened to ``(..., 6)``."""
-    col0 = mat[..., :, 0]
-    col1 = mat[..., :, 1]
-    return np.concatenate([col0, col1], axis=-1).astype(np.float32)
+def droid_eef_9d(position: np.ndarray, quat_wxyz: np.ndarray) -> np.ndarray:
+    """``(T, 9)``: xyz + rot6d, where rot6d is the first two rows of
+    (R @ correction) — the encoding GR00T-N1.7-DROID expects."""
+    rot = quat_wxyz_to_matrix(quat_wxyz) @ _DROID_EEF_ROTATION_CORRECT
+    rot6d = rot[:, :2, :].reshape(rot.shape[0], 6).astype(np.float32)
+    return np.concatenate([np.asarray(position, dtype=np.float32), rot6d], axis=1)
 
 
 def _gripper_column(
@@ -210,56 +218,28 @@ def _gripper_column(
     return normalize_gripper(values, reader.gripper_open_value, reader.gripper_closed_value)
 
 
-def joint_state(reader: Hdf5EpisodeReader, *, normalize_gripper_value: bool = True) -> np.ndarray:
-    gripper = _gripper_column(
-        reader, reader.gripper_joint_position, normalize=normalize_gripper_value
-    )
-    return np.concatenate([reader.arm_joint_position, gripper], axis=1).astype(np.float32)
-
-
-def joint_action(reader: Hdf5EpisodeReader, *, normalize_gripper_value: bool = True) -> np.ndarray:
-    action = reader.action_full.copy()
-    action[:, -1] = _gripper_column(reader, action[:, -1], normalize=normalize_gripper_value)
-    return action.astype(np.float32)
-
-
-def ee_state(reader: Hdf5EpisodeReader, *, normalize_gripper_value: bool = True) -> np.ndarray:
-    """``(T, 10)``: xyz (3) + 6D rotation (6) + gripper (1)."""
-    rot6d = matrix_to_rot6d(quat_wxyz_to_matrix(reader.ee_quat_world_wxyz))
-    gripper = _gripper_column(
-        reader, reader.gripper_joint_position, normalize=normalize_gripper_value
-    )
-    return np.concatenate([reader.ee_position_world, rot6d, gripper], axis=1).astype(np.float32)
-
-
-def ee_delta_action(
+def droid_state_action(
     reader: Hdf5EpisodeReader, *, normalize_gripper_value: bool = True
-) -> np.ndarray:
-    """``(T, 10)``: delta xyz (3) + relative-rotation 6D (6) + absolute gripper (1)."""
-    pos = reader.ee_position_world
-    mat = quat_wxyz_to_matrix(reader.ee_quat_world_wxyz)
-    num_frames = pos.shape[0]
-    delta_pos = np.zeros_like(pos, dtype=np.float32)
-    delta_rot6d = np.tile(_IDENTITY_ROT6D, (num_frames, 1))
-    if num_frames > 1:
-        delta_pos[:-1] = (pos[1:] - pos[:-1]).astype(np.float32)
-        relative = np.einsum("tij,tjk->tik", np.transpose(mat[:-1], (0, 2, 1)), mat[1:])
-        delta_rot6d[:-1] = matrix_to_rot6d(relative)
-    gripper = _gripper_column(reader, reader.action_full[:, -1:], normalize=normalize_gripper_value)
-    return np.concatenate([delta_pos, delta_rot6d, gripper], axis=1).astype(np.float32)
-
-
-def build_state_action(
-    reader: Hdf5EpisodeReader, action_space: str, *, normalize_gripper_value: bool = True
 ) -> tuple[np.ndarray, np.ndarray]:
-    if action_space == "joint":
-        return (
-            joint_state(reader, normalize_gripper_value=normalize_gripper_value),
-            joint_action(reader, normalize_gripper_value=normalize_gripper_value),
-        )
-    if action_space == "ee":
-        return (
-            ee_state(reader, normalize_gripper_value=normalize_gripper_value),
-            ee_delta_action(reader, normalize_gripper_value=normalize_gripper_value),
-        )
-    raise ValueError(f"unknown action_space: {action_space!r} (expected 'joint' or 'ee')")
+    """``(T, 17)`` state and action in the ``oxe_droid_relative_eef_relative_joint``
+    layout: ``[eef_9d (9), gripper_position (1), joint_position (7)]``.
+
+    The action stores absolute targets: next-frame measured EE pose, recorded
+    gripper target, recorded joint position target.
+    """
+    eef = droid_eef_9d(reader.ee_position_world, reader.ee_quat_world_wxyz)
+    gripper_state = _gripper_column(
+        reader, reader.gripper_joint_position, normalize=normalize_gripper_value
+    )
+    state = np.concatenate(
+        [eef, gripper_state, reader.arm_joint_position], axis=1
+    ).astype(np.float32)
+
+    eef_next = np.concatenate([eef[1:], eef[-1:]], axis=0)
+    gripper_target = _gripper_column(
+        reader, reader.action_full[:, -1:], normalize=normalize_gripper_value
+    )
+    action = np.concatenate(
+        [eef_next, gripper_target, reader.action_full[:, :-1]], axis=1
+    ).astype(np.float32)
+    return state, action

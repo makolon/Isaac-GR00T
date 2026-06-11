@@ -1,10 +1,18 @@
 """Convert polaris_real2sim TAMP HDF5 episodes to a GR00T N1.7 LeRobot v2.1 dataset.
 
+Targets GR00T's pretrained DROID embodiment (``oxe_droid_relative_eef_relative_joint``)
+so the fine-tuned checkpoint is plug-compatible with the unchanged zero-shot eval
+client: two letterboxed 180x320 views (``exterior_image_1_left`` <- sim
+``external_cam``, ``wrist_image_left`` <- sim ``wrist_cam``), 17-D state/action
+``[eef_9d, gripper_position, joint_position]`` with absolute action targets
+(GR00T's processor handles the relative encoding), and the
+``annotation.language.language_instruction`` language key. No custom modality
+config is generated — the embodiment is already registered in GR00T.
+
 Self-contained: writes the LeRobot v2.1 layout directly with pyarrow/imageio
-(GR00T ships no dataset-creation API), adds GR00T's ``meta/modality.json`` and a
-``NEW_EMBODIMENT`` modality config, and optionally runs GR00T's own ``stats.py``.
-Depends only on this repo's deps + the bundled ``polaris_hdf5`` reader; no lerobot
-package and no IsaacLab.
+(GR00T ships no dataset-creation API) and optionally runs GR00T's own
+``stats.py``. Depends only on this repo's deps + the bundled ``polaris_hdf5``
+reader; no lerobot package and no IsaacLab.
 
     cd third_party/gr00t
     uv sync --frozen          # gr00t + imageio/pyarrow/numpy
@@ -13,12 +21,10 @@ package and no IsaacLab.
                               # cp310 torchcodec wheel), so add h5py directly.
     uv run examples/polaris/convert_hdf5_to_lerobot.py \\
         --hdf5-root /path/to/tamp_hdf5_dataset \\
-        --output-root /path/to/out_gr00t_dataset \\
-        --action-space joint --compute-stats
+        --output-root /path/to/out_gr00t_dataset --compute-stats
 
-Then finetune in this same env via ``bash examples/finetune.sh ... --embodiment-tag new_embodiment``.
-``--action-space joint`` -> arm joints + gripper (NON_EEF); ``ee`` -> EE pose
-(xyz + 6D rot) + gripper as a RELATIVE EEF action.
+Then finetune in this same env via
+``bash examples/finetune.sh ... --embodiment-tag oxe_droid_relative_eef_relative_joint``.
 """
 
 from __future__ import annotations
@@ -29,9 +35,10 @@ from pathlib import Path
 import subprocess
 import sys
 
+import cv2
 import imageio.v2 as imageio
 import numpy as np
-from polaris_hdf5 import CameraMapping, Hdf5DatasetReader, Hdf5EpisodeReader, build_state_action
+from polaris_hdf5 import CameraMapping, Hdf5DatasetReader, Hdf5EpisodeReader, droid_state_action
 import pyarrow as pa
 import pyarrow.parquet as pq
 
@@ -43,10 +50,19 @@ _CHUNK_SIZE = 1000
 _VIDEO_CODEC = "h264"
 _VIDEO_PIX_FMT = "yuv420p"
 
+_DROID_EMBODIMENT_TAG = "oxe_droid_relative_eef_relative_joint"
+_DROID_IMAGE_H = 180
+_DROID_IMAGE_W = 320
+
 _GR00T_VIDEO_NAMES: dict[str, str] = {
-    "exterior_1": "front",
-    "exterior_2": "exterior_2",
-    "wrist": "wrist",
+    "exterior_1": "exterior_image_1_left",
+    "wrist": "wrist_image_left",
+}
+
+_MODALITY_SLICES: dict[str, dict[str, int]] = {
+    "eef_9d": {"start": 0, "end": 9},
+    "gripper_position": {"start": 9, "end": 10},
+    "joint_position": {"start": 10, "end": 17},
 }
 
 
@@ -54,17 +70,28 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--hdf5-root", required=True, type=Path)
     parser.add_argument("--output-root", required=True, type=Path)
-    parser.add_argument("--action-space", choices=("joint", "ee"), default="joint")
     parser.add_argument("--camera-map", default=None, help="JSON {role: hdf5_image_key} override")
     parser.add_argument("--robot-type", default="franka_robotiq")
     parser.add_argument("--fps", type=int, default=None)
     parser.add_argument("--raw-gripper", action="store_true")
-    parser.add_argument("--embodiment-tag", default="new_embodiment")
-    parser.add_argument("--modality-config-path", type=Path, default=None)
     parser.add_argument(
         "--compute-stats", action="store_true", help="run gr00t/data/stats.py afterwards"
     )
     return parser.parse_args()
+
+
+def _letterbox(frames: np.ndarray) -> np.ndarray:
+    """Pad-resize ``(T, H, W, 3)`` frames to DROID's 180x320, like the eval client."""
+    num_frames, height, width = frames.shape[0], frames.shape[1], frames.shape[2]
+    scale = min(_DROID_IMAGE_H / height, _DROID_IMAGE_W / width)
+    new_h, new_w = int(round(height * scale)), int(round(width * scale))
+    top = (_DROID_IMAGE_H - new_h) // 2
+    left = (_DROID_IMAGE_W - new_w) // 2
+    out = np.zeros((num_frames, _DROID_IMAGE_H, _DROID_IMAGE_W, 3), dtype=np.uint8)
+    for i, frame in enumerate(frames):
+        resized = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        out[i, top : top + new_h, left : left + new_w] = resized
+    return out
 
 
 def _write_video(path: Path, frames: np.ndarray, fps: int) -> None:
@@ -82,54 +109,15 @@ def _write_video(path: Path, frames: np.ndarray, fps: int) -> None:
     writer.close()
 
 
-def _modality_slices(action_space: str, dim: int) -> dict[str, dict[str, int]]:
-    if action_space == "joint":
-        return {
-            "single_arm": {"start": 0, "end": dim - 1},
-            "gripper": {"start": dim - 1, "end": dim},
-        }
-    return {"eef": {"start": 0, "end": 9}, "gripper": {"start": 9, "end": 10}}
-
-
-def _state_names(action_space: str, sample: Hdf5EpisodeReader) -> list[str]:
-    if action_space == "joint":
-        return [*sample.arm_joint_names, "gripper"]
-    return ["x", "y", "z", *[f"rot6d_{i}" for i in range(6)], "gripper"]
-
-
-def _modality_config_text(action_space: str, embodiment_tag: str) -> str:
-    video_keys = list(_GR00T_VIDEO_NAMES.values())
-    if action_space == "joint":
-        modality_keys = ["single_arm", "gripper"]
-        action_configs = (
-            "        ActionConfig(rep=ActionRepresentation.ABSOLUTE, type=ActionType.NON_EEF, format=ActionFormat.DEFAULT),\n"
-            "        ActionConfig(rep=ActionRepresentation.ABSOLUTE, type=ActionType.NON_EEF, format=ActionFormat.DEFAULT),\n"
-        )
-    else:
-        modality_keys = ["eef", "gripper"]
-        action_configs = (
-            "        ActionConfig(rep=ActionRepresentation.RELATIVE, type=ActionType.EEF, format=ActionFormat.XYZ_ROT6D),\n"
-            "        ActionConfig(rep=ActionRepresentation.ABSOLUTE, type=ActionType.NON_EEF, format=ActionFormat.DEFAULT),\n"
-        )
-    return (
-        "from gr00t.configs.data.embodiment_configs import register_modality_config\n"
-        "from gr00t.data.embodiment_tags import EmbodimentTag\n"
-        "from gr00t.data.types import (\n"
-        "    ActionConfig,\n    ActionFormat,\n    ActionRepresentation,\n    ActionType,\n    ModalityConfig,\n)\n\n\n"
-        "polaris_config = {\n"
-        f'    "video": ModalityConfig(delta_indices=[0], modality_keys={video_keys!r}),\n'
-        f'    "state": ModalityConfig(delta_indices=[0], modality_keys={modality_keys!r}),\n'
-        '    "action": ModalityConfig(\n'
-        "        delta_indices=list(range(0, 16)),\n"
-        f"        modality_keys={modality_keys!r},\n"
-        "        action_configs=[\n"
-        f"{action_configs}"
-        "        ],\n"
-        "    ),\n"
-        '    "language": ModalityConfig(delta_indices=[0], modality_keys=["annotation.human.task_description"]),\n'
-        "}\n\n"
-        f"register_modality_config(polaris_config, embodiment_tag=EmbodimentTag.{embodiment_tag.upper()})\n"
-    )
+def _state_names(sample: Hdf5EpisodeReader) -> list[str]:
+    return [
+        "eef_x",
+        "eef_y",
+        "eef_z",
+        *[f"eef_rot6d_{i}" for i in range(6)],
+        "gripper",
+        *sample.arm_joint_names,
+    ]
 
 
 def _build_features(
@@ -185,7 +173,7 @@ def main() -> None:
 
     sample = Hdf5EpisodeReader(episode_paths[0])
     fps = args.fps if args.fps is not None else sample.fps
-    state_names = _state_names(args.action_space, sample)
+    state_names = _state_names(sample)
 
     tasks: dict[str, int] = {}
     task_records: list[dict] = []
@@ -196,9 +184,7 @@ def main() -> None:
 
     for episode_index, path in enumerate(episode_paths):
         reader = Hdf5EpisodeReader(path)
-        state, action = build_state_action(
-            reader, args.action_space, normalize_gripper_value=normalize
-        )
+        state, action = droid_state_action(reader, normalize_gripper_value=normalize)
         state_dim, action_dim = int(state.shape[1]), int(action.shape[1])
         length = reader.num_frames
 
@@ -210,7 +196,7 @@ def main() -> None:
 
         chunk = episode_index // _CHUNK_SIZE
         for role, video_name in _GR00T_VIDEO_NAMES.items():
-            frames = reader.read_video(mapping.key_for(role))
+            frames = _letterbox(reader.read_video(mapping.key_for(role)))
             camera_shapes[video_name] = tuple(int(v) for v in frames.shape[1:])
             video_path = (
                 out
@@ -271,20 +257,14 @@ def main() -> None:
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
 
     modality = {
-        "state": _modality_slices(args.action_space, state_dim),
-        "action": _modality_slices(args.action_space, action_dim),
+        "state": _MODALITY_SLICES,
+        "action": _MODALITY_SLICES,
         "video": {name: {"original_key": f"observation.images.{name}"} for name in camera_shapes},
-        "annotation": {"human.task_description": {"original_key": "task_index"}},
+        "annotation": {"language.language_instruction": {"original_key": "task_index"}},
     }
     (meta_dir / "modality.json").write_text(json.dumps(modality, indent=2), encoding="utf-8")
 
-    config_path = args.modality_config_path or (out / "polaris_modality_config.py")
-    config_path.write_text(
-        _modality_config_text(args.action_space, args.embodiment_tag), encoding="utf-8"
-    )
-
     print(f"[gr00t-convert] done: {len(episode_records)} episodes -> {out}", flush=True)
-    print(f"[gr00t-convert] modality config: {config_path}", flush=True)
 
     if args.compute_stats:
         stats_script = _GR00T_ROOT / "gr00t" / "data" / "stats.py"
@@ -295,9 +275,7 @@ def main() -> None:
                 "--dataset-path",
                 str(out),
                 "--embodiment-tag",
-                args.embodiment_tag,
-                "--modality-config-path",
-                str(config_path),
+                _DROID_EMBODIMENT_TAG,
             ],
             check=True,
         )
